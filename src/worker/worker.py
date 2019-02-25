@@ -840,7 +840,7 @@ def main():
     if args.connect_redis is not None:
 
         import os
-        import redis_worker as rediswrap
+        import rediscomm as rediswrap
 
         # make queue
         tasks = rediswrap.Taskqueue(args.connect_redis, 'DEBUG')
