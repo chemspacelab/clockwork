@@ -84,23 +84,84 @@ class Taskqueue(object):
 		while True:
 			if deadline > 0 and deadline - time.time() < 120:
 				break
-			task_str = self._start_task()
-			if task_str is None:
+			gztaskstring = self._start_task()
+			if gztaskstring is None:
 				break
-			result_str, log_str = callback(task_str)
-			self._store_result(task_str, result_str, log_str)
+			taskstring = gzip.decompress(gztaskstring).decode('utf8')
+			result_str, log_str = callback(taskstring)
+			gzresultstring = gzip.compress(result_str.encode())
+			self._store_result(gztaskstring, gzresultstring, log_str)
 
 	def insert(self, taskstring):
 		""" Enqueues a task. """
-		self._con.lpush(self._prefix + '_Queue', taskstring)
+		gztaskstring = gzip.compress(taskstring.encode())
+		self._con.lpush(self._prefix + '_Queue', gztaskstring)
 
 	def get_results(self, purge_after=False):
 		""" Fetches and optionally deletes the results."""
-		results = self._con.lrange(self._prefix + '_Results')
+		results = self._con.lrange(self._prefix + '_Results', 0, -1)
 		results = [gzip.decompress(_).decode('utf8') for _ in results]
 		if purge_after:
 			self._con.delete(self._prefix + '_Results')
 		return results
+
+	def discover_projects(self):
+		""" Finds valid projects using the selected database."""
+		projects = []
+		for kind in 'Results Queue Log Running Started'.split():
+			keys = self._con.keys('*_%s' % kind)
+			projects += [_.decode('utf8')[:-(len(kind)+1)] for _ in keys]
+		return list(set(projects))
+
+	def get_orphaned(self, projectname=None):
+		""" Returns a list of orphaned task ids. """
+		now = time.time()
+		orphaned = []
+		if projectname is None:
+			projectname = self._prefix
+		for taskid, starttime in self._con.hscan_iter('%s_Started' % self._prefix):
+			if now - float(starttime) > 20*60:
+				orphaned.append(taskid)
+		return orphaned
+
+	def requeue_orphaned(self):
+		orphaned = [_.decode('utf8') for _ in self.get_orphaned()]
+
+		running = set(self._con.lrange(self._prefix + '_Running', 0, -1))
+		tobeinserted = []
+		for workpackage in running:
+			taskid = hashlib.md5(workpackage).hexdigest()
+			if taskid in orphaned:
+				self._con.hdel('%s_Started' % self._prefix, taskid)
+				self._con.lrem('%s_Running' % self._prefix, 0, workpackage)
+				tobeinserted.append(workpackage)
+
+		# remove orphans without workpackage in running state
+		for orphan in orphaned:
+			self._con.hdel('%s_Started' % self._prefix, orphan)
+
+		# insert
+		for workpackage in tobeinserted:
+			self.insert(workpackage)
+
+	def print_stats(self, projectname):
+		print ('Summary for project %s' % projectname)
+		print ('  Waiting:       ', self._con.llen('%s_Queue' % projectname))
+		print ('  Results:       ', self._con.llen('%s_Results' % projectname))
+		errors = self._con.hlen('%s_Log' % projectname)
+		errorattn = '!' if errors > 0 else ' '
+		print ('%s Errors in log: ' % errorattn, errors)
+		orphaned = len(self.get_orphaned(projectname))
+		orphanattn = '!' if orphaned > 0 else ' '
+		print ('%s Orphaned:      ' % orphanattn, orphaned)
+		print ('  Running:       ', self._con.llen('%s_Running' % projectname) - orphaned)
+
+		# get rate info
+		statsentries = sum([self._con.llen(_) for _ in self._con.keys('%s_Stats:*' % projectname)])
+		print ('    Packages / h:', statsentries)
+
+	def has_work(self):
+		return self._con.llen('%s_Queue' % self._prefix) > 0
 
 def do_work(task):
 	""" Sample task evaluation. Returns a result as string and an optional log message."""
@@ -108,11 +169,23 @@ def do_work(task):
 	return "result", "Another information"
 
 if __name__ == '__main__':
-	tasks = Taskqueue(os.getenv('CHEMSPACELAB_REDIS_CONNECTION'), 'DEBUG')
-	for i in range(3):
-		tasks.insert('test%d' % i)
-	try:
-		tasks.main_loop(do_work)
-	except:
-		# Ugly catch-all handler: no SLURM log file wanted!
-		sys.exit(1)
+	import argparse
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--status', action="store_true", help='')
+	parser.add_argument('--haswork', type=str, help='Requires a project name.', metavar='project')
+	parser.add_argument('--requeue_orphaned', type=str, help='Requires a project name.', metavar='project')
+
+	args = parser.parse_args()
+
+	if args.haswork:
+		tasks = Taskqueue(os.getenv('CHEMSPACELAB_REDIS_CONNECTION'), args.haswork)
+		sys.exit(not tasks.has_work())
+
+	if args.status:
+		tasks = Taskqueue(os.getenv('CHEMSPACELAB_REDIS_CONNECTION'), 'DEBUG')
+		for project in sorted(tasks.discover_projects()):
+			tasks.print_stats(project)
+
+	if args.requeue_orphaned:
+		tasks = Taskqueue(os.getenv('CHEMSPACELAB_REDIS_CONNECTION'), args.requeue_orphaned)
+		tasks.requeue_orphaned()

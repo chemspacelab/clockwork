@@ -5,14 +5,16 @@ import json
 import itertools
 import time
 
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import numpy as np
-import rmsd
+# import rmsd
 from qml import fchl
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, ChemicalForceFields
 
+import adm_merge
+import adm_molecule
 
 def load_sdf(filename):
     """
@@ -473,7 +475,7 @@ def get_conformation(mol, res, torsions):
     # Get conformer and origin
     conformer = mol.GetConformer()
     origin = conformer.GetPositions()
-    origin -= rmsd.centroid(origin)
+    # TODO origin -= rmsd.centroid(origin)
 
     # Origin angle
     origin_angles = []
@@ -586,7 +588,8 @@ def get_torsions(mol):
 def conformers(mol, torsions, resolutions, unique_method=unique_energy, debug=False):
 
     # time
-    here = time.time()
+    if debug:
+        here = time.time()
 
     # Find all
     energies, positions, states = get_conformation(mol, resolutions, torsions)
@@ -607,22 +610,144 @@ def conformers(mol, torsions, resolutions, unique_method=unique_energy, debug=Fa
     # Find uniques
     u_len, u_idx = unique_method([], [], positions, energies, debug=debug)
 
-    timestamp = N/ (time.time() - here)
-    # timestamp = (time.time() - here)
+    # timestamp = N/ (time.time() - here)
+    if debug:
+        timestamp = (time.time() - here)
+        print("debug: {:}, converged={:}, speed={:5.1f}, new={:}".format("", N, timestamp, np.round(energies, 1)))
 
-    # print("debug: {:}, converged={:}, speed={:5.1f}, new={:}".format("", N, timestamp, np.round(energies, 2)[u_idx]))
-
-    return energies[u_idx], positions[u_idx], u_idx
+    return energies, positions
 
 
-def run_jobs(moldb, tordb, jobs):
+def run_jobs(moldb, tordb, jobs, debug=False, dump_sdf=None):
+    """
+    calculate conformers
+
+    args:
+        list of molecules
+        list of molecule torsions
+        list of str jobs
+
+    return:
+        str results conformers
+
+    """
+
+    if type(jobs) is str:
+        jobs = jobs.split(";")
+
+    # we assume all jobs are the same molecule
+    molidx = jobs[0].split(",")[0]
+    molidx = int(molidx)
+    mol = moldb[molidx]
+
+    atoms = [atom for atom in mol.GetAtoms()]
+    atoms_str = [atom.GetSymbol() for atom in atoms]
+    atoms_int = [atom.GetAtomicNum() for atom in atoms]
+
+    results = []
+
+    for job in jobs:
+
+        job = job.split(",")
+        idx_mol = job[0]
+        idx_mol = int(idx_mol)
+        idx_torsions = job[1].split()
+        idx_torsions = [int(x) for x in idx_torsions]
+        resolution = job[2]
+        resolution = int(resolution)
+
+        torsions = tordb[idx_mol][idx_torsions]
+
+        origin = [molidx, idx_torsions]
+
+        jobresults = run_job(mol, torsions, resolution, atoms_int, origin, debug=True)
+
+        results += jobresults
+
+    # wp level merge
+    if len(results) == 0:
+        print(results, job)
+
+    results = adm_merge.energyandfchl(results, atoms_int, debug=True)
+
+    #
+    if dump_sdf is not None:
+        print("saving results to", dump_sdf)
+        adm_molecule.save_results(mol, results, dump_sdf)
+
+    # encode and send back
+    for i, result in enumerate(results):
+        result = json.dumps(result)
+        result = result.replace(" ", "")
+        results[i] = result
+
+    results = "\n".join(results)
+
+    return results, None
+
+
+def run_job(mol, torsions, resolution, atoms, origin, debug=False):
+
+
+    N_torsions = len(torsions)
+
+    # generator all combinations for this level of torsions
+
+    rest = range(0, resolution)
+    rest = list(rest) + [resolution]
+
+    combinations = itertools.product(rest, repeat=N_torsions)
+    combinations = list(combinations)
+    combinations = [list(x) for x in combinations if resolution in x]
+
+    rtnresults = []
+
+    for resolutions in combinations:
+
+        energies, positions = conformers(mol, torsions, resolutions)
+
+        results = []
+
+        for energy, coord in zip(energies, positions):
+            result = [*origin, resolutions, 0, energy, np.round(coord, 5).flatten().tolist()]
+            results.append(result)
+
+        # merge job
+        if len(results) == 0:
+            continue
+
+        results = adm_merge.energyandfchl(results, atoms)
+
+        if debug:
+            print("job", resolutions, len(energies), "->", len(results), np.round(energies, decimals=1).tolist())
+
+        rtnresults += results
+
+    # merge job job
+    rtnresults = adm_merge.energyandfchl(rtnresults, atoms, debug=debug)
+
+    return rtnresults
+
+
+def run_jobs_nein(moldb, tordb, jobs, debug=False):
 
     # if str from redit, convert to list
     if type(jobs) != list: jobs = eval(jobs.decode())
 
     data = []
 
+    # assume same molecule for all jobs!
+    molidx = jobs[0].split(",")[0]
+    molidx = int(molidx)
+    mol = moldb[molidx]
+
+    atoms = [atom for atom in mol.GetAtoms()]
+    atoms_str = [atom.GetSymbol() for atom in atoms]
+    atoms_int = [atom.GetAtomicNum() for atom in atoms]
+
     for job in jobs:
+
+        here = time.time()
 
         job = job.split(",")
 
@@ -640,25 +765,52 @@ def run_jobs(moldb, tordb, jobs):
         torsions = torsions[torsions_idx]
 
         # minimize
-        energies, positions, u_idx = conformers(moldb[mol_idx], torsions, resolutions)
+        energies, positions = conformers(moldb[mol_idx], torsions, resolutions)
 
         origin = [mol_idx, torsions_idx, resolutions]
 
-        # TODO Choice with guido
-        for energy, coord, ui in zip(energies, positions, u_idx):
+        jobdata = []
 
-            result = json.dumps([origin, int(ui), energy, np.round(coord, 5).flatten().tolist()])
-            result = result.replace(" ", "")
+        for energy, coord in zip(energies, positions):
+            # job syntax
+            result = [*origin, 0, energy, np.round(coord, 5).flatten().tolist()]
+            jobdata.append(result)
 
-            data.append(result)
+        # merge job-wiese
+        jobdata = merge.energyandfchl(jobdata, atoms_int)
+        data += jobdata
 
-        print("calculated", job, len(energies))
+        if debug:
+            now = time.time() - here
+            speed = len(energies) / now
+            print("calculated", job, len(data), "time={:5.2f}, speed={:5.2f}".format(now, speed))
 
+    # Merge same conformers, by energy
+    # merge wp-wise
+    if debug:
+        here = time.time()
+    data = merge.energyandfchl(data, atoms_int, debug=debug)
+    if debug:
+        print("merged in", time.time()-here, "sec")
+
+    for i, result in enumerate(data):
+        result = json.dumps(result)
+        result = result.replace(" ", "")
+        data[i] = result
 
     data = "\n".join(data)
-    data = gzip.compress(data.encode())
 
     return data, None
+
+
+def wraprunjobs(moldb, tordb, jobs, debug=False):
+
+    # try:
+    rtn = run_jobs(moldb, tordb, jobs, debug=debug)
+    # except:
+    #     rtn = ([], "arrgh it crashed")
+
+    return rtn
 
 
 def getthoseconformers(mol, torsions, torsion_bodies, clockwork_resolutions, debug=False, unique_method=unique_energy):
@@ -754,7 +906,7 @@ def getthoseconformers(mol, torsions, torsion_bodies, clockwork_resolutions, deb
     #     y_view = np.where(n_counter_flag == flag)
     #     plt.plot(x_axis[y_view], n_counter_list[y_view], ".")
 
-    plt.savefig("fig_conf_convergence.png")
+    # plt.savefig("fig_conf_convergence.png")
 
     print("out of total {:} minimizations".format(n_counter_all))
 
@@ -804,7 +956,7 @@ def main():
 
     elif ext == "gz":
 
-        inf = gzip.open(filename)
+        inf = gzip.open(args.filename)
         moldb = load_sdf_file(inf)
 
     else:
@@ -817,6 +969,7 @@ def main():
 
     if args.torsions_file is None:
 
+        # make db on worker
         for mol in moldb:
 
             torsions = get_torsions(mol)
@@ -825,8 +978,7 @@ def main():
 
     else:
 
-        # TODO Read file and make db
-
+        # Read file and make db
         with open(args.torsions_file) as f:
 
             for line in f:
@@ -843,20 +995,12 @@ def main():
         import rediscomm as rediswrap
 
         # make queue
-        tasks = rediswrap.Taskqueue(args.connect_redis, 'DEBUG')
+        tasks = rediswrap.Taskqueue(args.connect_redis, 'test_1')
 
-        # Submit job list
-        # if True:
-        #     print("submitting jobs")
-        #     f = open("/home/charnley/dev/qml-qm9/qm9-C7O2H10/sample.workpackages")
-        #     for i, line in enumerate(f):
-        #
-        #         if i > 200: break
-        #
-        #         line = line.strip()
-        #         tasks.insert(line)
+        if args.debug:
+            print("connected to redis")
 
-        do_work = lambda x: run_jobs(moldb, tordb, x)
+        do_work = lambda x: wraprunjobs(moldb, tordb, x, debug=args.debug)
         tasks.main_loop(do_work)
 
 
@@ -864,13 +1008,20 @@ def main():
 
         # Read archive workers from stdin
 
-        workpackage = \
-        ['0 , 32 36 38 , 2 0 0 , 2', '0 , 32 36 38 , 2 0 1 , 2', '0 , 32 36 38 , 2 0 2 , 4', '0 , 32 36 38 , 2 0 3 , 8', '0 , 32 36 38 , 2 1 0 , 2', '0 , 32 36 38 , 2 1 1 , 2', '0 , 32 36 38 , 2 1 2 , 4', '0 , 32 36 38 , 2 1 3 , 8', '0 , 32 36 38 , 2 2 0 , 4', '0 , 32 36 38 , 2 2 1 , 4', '0 , 32 36 38 , 2 2 2 , 8', '0 , 32 36 38 , 2 2 3 , 16', '0 , 32 36 38 , 2 3 0 , 8', '0 , 32 36 38 , 2 3 1 , 8', '0 , 32 36 38 , 2 3 2 , 16', '0 , 32 36 38 , 2 3 3 , 32', '0 , 32 36 38 , 3 0 0 , 4', '0 , 32 36 38 , 3 0 1 , 4', '0 , 32 36 38 , 3 0 2 , 8', '0 , 32 36 38 , 3 0 3 , 16', '0 , 32 36 38 , 3 1 0 , 4', '0 , 32 36 38 , 3 1 1 , 4', '0 , 32 36 38 , 3 1 2 , 8', '0 , 32 36 38 , 3 1 3 , 16', '0 , 32 36 38 , 3 2 0 , 8', '0 , 32 36 38 , 3 2 1 , 8', '0 , 32 36 38 , 3 2 2 , 16', '0 , 32 36 38 , 3 2 3 , 32', '0 , 32 36 38 , 3 3 0 , 16', '0 , 32 36 38 , 3 3 1 , 16', '0 , 32 36 38 , 3 3 2 , 32', '0 , 32 36 38 , 3 3 3 , 64', '0 , 32 36 39 , 0 0 0 , 1', '0 , 32 36 39 , 0 0 1 , 1', '0 , 32 36 39 , 0 0 2 , 2', '0 , 32 36 39 , 0 0 3 , 4', '0 , 32 36 39 , 0 1 0 , 1', '0 , 32 36 39 , 0 1 1 , 1', '0 , 32 36 39 , 0 1 2 , 2', '0 , 32 36 39 , 0 1 3 , 4', '0 , 32 36 39 , 0 2 0 , 2', '0 , 32 36 39 , 0 2 1 , 2', '0 , 32 36 39 , 0 2 2 , 4', '0 , 32 36 39 , 0 2 3 , 8', '0 , 32 36 39 , 0 3 0 , 4', '0 , 32 36 39 , 0 3 1 , 4', '0 , 32 36 39 , 0 3 2 , 8', '0 , 32 36 39 , 0 3 3 , 16', '0 , 32 36 39 , 1 0 0 , 1', '0 , 32 36 39 , 1 0 1 , 1', '0 , 32 36 39 , 1 0 2 , 2', '0 , 32 36 39 , 1 0 3 , 4', '0 , 32 36 39 , 1 1 0 , 1', '0 , 32 36 39 , 1 1 1 , 1', '0 , 32 36 39 , 1 1 2 , 2', '0 , 32 36 39 , 1 1 3 , 4', '0 , 32 36 39 , 1 2 0 , 2', '0 , 32 36 39 , 1 2 1 , 2', '0 , 32 36 39 , 1 2 2 , 4', '0 , 32 36 39 , 1 2 3 , 8', '0 , 32 36 39 , 1 3 0 , 4', '0 , 32 36 39 , 1 3 1 , 4', '0 , 32 36 39 , 1 3 2 , 8', '0 , 32 36 39 , 1 3 3 , 16', '0 , 32 36 39 , 2 0 0 , 2', '0 , 32 36 39 , 2 0 1 , 2', '0 , 32 36 39 , 2 0 2 , 4', '0 , 32 36 39 , 2 0 3 , 8', '0 , 32 36 39 , 2 1 0 , 2', '0 , 32 36 39 , 2 1 1 , 2', '0 , 32 36 39 , 2 1 2 , 4', '0 , 32 36 39 , 2 1 3 , 8', '0 , 32 36 39 , 2 2 0 , 4', '0 , 32 36 39 , 2 2 1 , 4', '0 , 32 36 39 , 2 2 2 , 8', '0 , 32 36 39 , 2 2 3 , 16', '0 , 32 36 39 , 2 3 0 , 8', '0 , 32 36 39 , 2 3 1 , 8', '0 , 32 36 39 , 2 3 2 , 16', '0 , 32 36 39 , 2 3 3 , 32', '0 , 32 36 39 , 3 0 0 , 4', '0 , 32 36 39 , 3 0 1 , 4', '0 , 32 36 39 , 3 0 2 , 8', '0 , 32 36 39 , 3 0 3 , 16', '0 , 32 36 39 , 3 1 0 , 4', '0 , 32 36 39 , 3 1 1 , 4', '0 , 32 36 39 , 3 1 2 , 8', '0 , 32 36 39 , 3 1 3 , 16', '0 , 32 36 39 , 3 2 0 , 8', '0 , 32 36 39 , 3 2 1 , 8', '0 , 32 36 39 , 3 2 2 , 16', '0 , 32 36 39 , 3 2 3 , 32', '0 , 32 36 39 , 3 3 0 , 16', '0 , 32 36 39 , 3 3 1 , 16', '0 , 32 36 39 , 3 3 2 , 32', '0 , 32 36 39 , 3 3 3 , 64', '0 , 32 36 40 , 0 0 0 , 1', '0 , 32 36 40 , 0 0 1 , 1', '0 , 32 36 40 , 0 0 2 , 2', '0 , 32 36 40 , 0 0 3 , 4', '0 , 32 36 40 , 0 1 0 , 1', '0 , 32 36 40 , 0 1 1 , 1', '0 , 32 36 40 , 0 1 2 , 2', '0 , 32 36 40 , 0 1 3 , 4', '0 , 32 36 40 , 0 2 0 , 2', '0 , 32 36 40 , 0 2 1 , 2', '0 , 32 36 40 , 0 2 2 , 4', '0 , 32 36 40 , 0 2 3 , 8', '0 , 32 36 40 , 0 3 0 , 4', '0 , 32 36 40 , 0 3 1 , 4', '0 , 32 36 40 , 0 3 2 , 8', '0 , 32 36 40 , 0 3 3 , 16', '0 , 32 36 40 , 1 0 0 , 1', '0 , 32 36 40 , 1 0 1 , 1', '0 , 32 36 40 , 1 0 2 , 2', '0 , 32 36 40 , 1 0 3 , 4', '0 , 32 36 40 , 1 1 0 , 1', '0 , 32 36 40 , 1 1 1 , 1', '0 , 32 36 40 , 1 1 2 , 2', '0 , 32 36 40 , 1 1 3 , 4', '0 , 32 36 40 , 1 2 0 , 2', '0 , 32 36 40 , 1 2 1 , 2', '0 , 32 36 40 , 1 2 2 , 4', '0 , 32 36 40 , 1 2 3 , 8', '0 , 32 36 40 , 1 3 0 , 4', '0 , 32 36 40 , 1 3 1 , 4', '0 , 32 36 40 , 1 3 2 , 8', '0 , 32 36 40 , 1 3 3 , 16', '0 , 32 36 40 , 2 0 0 , 2', '0 , 32 36 40 , 2 0 1 , 2', '0 , 32 36 40 , 2 0 2 , 4', '0 , 32 36 40 , 2 0 3 , 8', '0 , 32 36 40 , 2 1 0 , 2', '0 , 32 36 40 , 2 1 1 , 2', '0 , 32 36 40 , 2 1 2 , 4', '0 , 32 36 40 , 2 1 3 , 8', '0 , 32 36 40 , 2 2 0 , 4', '0 , 32 36 40 , 2 2 1 , 4', '0 , 32 36 40 , 2 2 2 , 8', '0 , 32 36 40 , 2 2 3 , 16', '0 , 32 36 40 , 2 3 0 , 8', '0 , 32 36 40 , 2 3 1 , 8', '0 , 32 36 40 , 2 3 2 , 16', '0 , 32 36 40 , 2 3 3 , 32', '0 , 32 36 40 , 3 0 0 , 4', '0 , 32 36 40 , 3 0 1 , 4', '0 , 32 36 40 , 3 0 2 , 8', '0 , 32 36 40 , 3 0 3 , 16', '0 , 32 36 40 , 3 1 0 , 4', '0 , 32 36 40 , 3 1 1 , 4', '0 , 32 36 40 , 3 1 2 , 8', '0 , 32 36 40 , 3 1 3 , 16', '0 , 32 36 40 , 3 2 0 , 8', '0 , 32 36 40 , 3 2 1 , 8', '0 , 32 36 40 , 3 2 2 , 16', '0 , 32 36 40 , 3 2 3 , 32', '0 , 32 36 40 , 3 3 0 , 16', '0 , 32 36 40 , 3 3 1 , 16', '0 , 32 36 40 , 3 3 2 , 32', '0 , 32 36 40 , 3 3 3 , 64', '0 , 32 37 38 , 0 0 0 , 1', '0 , 32 37 38 , 0 0 1 , 1', '0 , 32 37 38 , 0 0 2 , 2', '0 , 32 37 38 , 0 0 3 , 4', '0 , 32 37 38 , 0 1 0 , 1', '0 , 32 37 38 , 0 1 1 , 1', '0 , 32 37 38 , 0 1 2 , 2', '0 , 32 37 38 , 0 1 3 , 4', '0 , 32 37 38 , 0 2 0 , 2', '0 , 32 37 38 , 0 2 1 , 2', '0 , 32 37 38 , 0 2 2 , 4', '0 , 32 37 38 , 0 2 3 , 8', '0 , 32 37 38 , 0 3 0 , 4', '0 , 32 37 38 , 0 3 1 , 4', '0 , 32 37 38 , 0 3 2 , 8', '0 , 32 37 38 , 0 3 3 , 16', '0 , 32 37 38 , 1 0 0 , 1', '0 , 32 37 38 , 1 0 1 , 1', '0 , 32 37 38 , 1 0 2 , 2', '0 , 32 37 38 , 1 0 3 , 4', '0 , 32 37 38 , 1 1 0 , 1', '0 , 32 37 38 , 1 1 1 , 1', '0 , 32 37 38 , 1 1 2 , 2', '0 , 32 37 38 , 1 1 3 , 4', '0 , 32 37 38 , 1 2 0 , 2', '0 , 32 37 38 , 1 2 1 , 2', '0 , 32 37 38 , 1 2 2 , 4', '0 , 32 37 38 , 1 2 3 , 8', '0 , 32 37 38 , 1 3 0 , 4', '0 , 32 37 38 , 1 3 1 , 4', '0 , 32 37 38 , 1 3 2 , 8', '0 , 32 37 38 , 1 3 3 , 16', '0 , 32 37 38 , 2 0 0 , 2', '0 , 32 37 38 , 2 0 1 , 2', '0 , 32 37 38 , 2 0 2 , 4', '0 , 32 37 38 , 2 0 3 , 8', '0 , 32 37 38 , 2 1 0 , 2', '0 , 32 37 38 , 2 1 1 , 2', '0 , 32 37 38 , 2 1 2 , 4', '0 , 32 37 38 , 2 1 3 , 8', '0 , 32 37 38 , 2 2 0 , 4', '0 , 32 37 38 , 2 2 1 , 4', '0 , 32 37 38 , 2 2 2 , 8', '0 , 32 37 38 , 2 2 3 , 16', '0 , 32 37 38 , 2 3 0 , 8', '0 , 32 37 38 , 2 3 1 , 8', '0 , 32 37 38 , 2 3 2 , 16', '0 , 32 37 38 , 2 3 3 , 32', '0 , 32 37 38 , 3 0 0 , 4', '0 , 32 37 38 , 3 0 1 , 4', '0 , 32 37 38 , 3 0 2 , 8', '0 , 32 37 38 , 3 0 3 , 16', '0 , 32 37 38 , 3 1 0 , 4', '0 , 32 37 38 , 3 1 1 , 4', '0 , 32 37 38 , 3 1 2 , 8', '0 , 32 37 38 , 3 1 3 , 16', '0 , 32 37 38 , 3 2 0 , 8', '0 , 32 37 38 , 3 2 1 , 8', '0 , 32 37 38 , 3 2 2 , 16', '0 , 32 37 38 , 3 2 3 , 32', '0 , 32 37 38 , 3 3 0 , 16', '0 , 32 37 38 , 3 3 1 , 16', '0 , 32 37 38 , 3 3 2 , 32', '0 , 32 37 38 , 3 3 3 , 64', '0 , 32 37 39 , 0 0 0 , 1', '0 , 32 37 39 , 0 0 1 , 1', '0 , 32 37 39 , 0 0 2 , 2', '0 , 32 37 39 , 0 0 3 , 4', '0 , 32 37 39 , 0 1 0 , 1', '0 , 32 37 39 , 0 1 1 , 1', '0 , 32 37 39 , 0 1 2 , 2', '0 , 32 37 39 , 0 1 3 , 4', '0 , 32 37 39 , 0 2 0 , 2', '0 , 32 37 39 , 0 2 1 , 2', '0 , 32 37 39 , 0 2 2 , 4', '0 , 32 37 39 , 0 2 3 , 8', '0 , 32 37 39 , 0 3 0 , 4', '0 , 32 37 39 , 0 3 1 , 4', '0 , 32 37 39 , 0 3 2 , 8', '0 , 32 37 39 , 0 3 3 , 16', '0 , 32 37 39 , 1 0 0 , 1', '0 , 32 37 39 , 1 0 1 , 1', '0 , 32 37 39 , 1 0 2 , 2', '0 , 32 37 39 , 1 0 3 , 4', '0 , 32 37 39 , 1 1 0 , 1', '0 , 32 37 39 , 1 1 1 , 1', '0 , 32 37 39 , 1 1 2 , 2', '0 , 32 37 39 , 1 1 3 , 4', '0 , 32 37 39 , 1 2 0 , 2', '0 , 32 37 39 , 1 2 1 , 2', '0 , 32 37 39 , 1 2 2 , 4', '0 , 32 37 39 , 1 2 3 , 8', '0 , 32 37 39 , 1 3 0 , 4', '0 , 32 37 39 , 1 3 1 , 4', '0 , 32 37 39 , 1 3 2 , 8', '0 , 32 37 39 , 1 3 3 , 16', '0 , 32 37 39 , 2 0 0 , 2', '0 , 32 37 39 , 2 0 1 , 2', '0 , 32 37 39 , 2 0 2 , 4', '0 , 32 37 39 , 2 0 3 , 8', '0 , 32 37 39 , 2 1 0 , 2', '0 , 32 37 39 , 2 1 1 , 2', '0 , 32 37 39 , 2 1 2 , 4', '0 , 32 37 39 , 2 1 3 , 8', '0 , 32 37 39 , 2 2 0 , 4', '0 , 32 37 39 , 2 2 1 , 4', '0 , 32 37 39 , 2 2 2 , 8', '0 , 32 37 39 , 2 2 3 , 16', '0 , 32 37 39 , 2 3 0 , 8', '0 , 32 37 39 , 2 3 1 , 8', '0 , 32 37 39 , 2 3 2 , 16', '0 , 32 37 39 , 2 3 3 , 32', '0 , 32 37 39 , 3 0 0 , 4', '0 , 32 37 39 , 3 0 1 , 4', '0 , 32 37 39 , 3 0 2 , 8', '0 , 32 37 39 , 3 0 3 , 16', '0 , 32 37 39 , 3 1 0 , 4', '0 , 32 37 39 , 3 1 1 , 4', '0 , 32 37 39 , 3 1 2 , 8', '0 , 32 37 39 , 3 1 3 , 16', '0 , 32 37 39 , 3 2 0 , 8', '0 , 32 37 39 , 3 2 1 , 8', '0 , 32 37 39 , 3 2 2 , 16', '0 , 32 37 39 , 3 2 3 , 32', '0 , 32 37 39 , 3 3 0 , 16', '0 , 32 37 39 , 3 3 1 , 16', '0 , 32 37 39 , 3 3 2 , 32', '0 , 32 37 39 , 3 3 3 , 64', '0 , 32 37 40 , 0 0 0 , 1', '0 , 32 37 40 , 0 0 1 , 1', '0 , 32 37 40 , 0 0 2 , 2', '0 , 32 37 40 , 0 0 3 , 4', '0 , 32 37 40 , 0 1 0 , 1', '0 , 32 37 40 , 0 1 1 , 1', '0 , 32 37 40 , 0 1 2 , 2', '0 , 32 37 40 , 0 1 3 , 4', '0 , 32 37 40 , 0 2 0 , 2', '0 , 32 37 40 , 0 2 1 , 2', '0 , 32 37 40 , 0 2 2 , 4', '0 , 32 37 40 , 0 2 3 , 8', '0 , 32 37 40 , 0 3 0 , 4', '0 , 32 37 40 , 0 3 1 , 4', '0 , 32 37 40 , 0 3 2 , 8', '0 , 32 37 40 , 0 3 3 , 16', '0 , 32 37 40 , 1 0 0 , 1', '0 , 32 37 40 , 1 0 1 , 1', '0 , 32 37 40 , 1 0 2 , 2', '0 , 32 37 40 , 1 0 3 , 4', '0 , 32 37 40 , 1 1 0 , 1', '0 , 32 37 40 , 1 1 1 , 1', '0 , 32 37 40 , 1 1 2 , 2', '0 , 32 37 40 , 1 1 3 , 4', '0 , 32 37 40 , 1 2 0 , 2', '0 , 32 37 40 , 1 2 1 , 2', '0 , 32 37 40 , 1 2 2 , 4', '0 , 32 37 40 , 1 2 3 , 8', '0 , 32 37 40 , 1 3 0 , 4', '0 , 32 37 40 , 1 3 1 , 4', '0 , 32 37 40 , 1 3 2 , 8', '0 , 32 37 40 , 1 3 3 , 16', '0 , 32 37 40 , 2 0 0 , 2', '0 , 32 37 40 , 2 0 1 , 2', '0 , 32 37 40 , 2 0 2 , 4', '0 , 32 37 40 , 2 0 3 , 8', '0 , 32 37 40 , 2 1 0 , 2', '0 , 32 37 40 , 2 1 1 , 2', '0 , 32 37 40 , 2 1 2 , 4', '0 , 32 37 40 , 2 1 3 , 8', '0 , 32 37 40 , 2 2 0 , 4', '0 , 32 37 40 , 2 2 1 , 4', '0 , 32 37 40 , 2 2 2 , 8', '0 , 32 37 40 , 2 2 3 , 16', '0 , 32 37 40 , 2 3 0 , 8', '0 , 32 37 40 , 2 3 1 , 8', '0 , 32 37 40 , 2 3 2 , 16', '0 , 32 37 40 , 2 3 3 , 32', '0 , 32 37 40 , 3 0 0 , 4', '0 , 32 37 40 , 3 0 1 , 4', '0 , 32 37 40 , 3 0 2 , 8', '0 , 32 37 40 , 3 0 3 , 16', '0 , 32 37 40 , 3 1 0 , 4', '0 , 32 37 40 , 3 1 1 , 4', '0 , 32 37 40 , 3 1 2 , 8', '0 , 32 37 40 , 3 1 3 , 16', '0 , 32 37 40 , 3 2 0 , 8', '0 , 32 37 40 , 3 2 1 , 8', '0 , 32 37 40 , 3 2 2 , 16', '0 , 32 37 40 , 3 2 3 , 32', '0 , 32 37 40 , 3 3 0 , 16', '0 , 32 37 40 , 3 3 1 , 16', '0 , 32 37 40 , 3 3 2 , 32', '0 , 32 37 40 , 3 3 3 , 64', '0 , 32 38 39 , 0 0 0 , 1', '0 , 32 38 39 , 0 0 1 , 1', '0 , 32 38 39 , 0 0 2 , 2', '0 , 32 38 39 , 0 0 3 , 4', '0 , 32 38 39 , 0 1 0 , 1', '0 , 32 38 39 , 0 1 1 , 1', '0 , 32 38 39 , 0 1 2 , 2', '0 , 32 38 39 , 0 1 3 , 4', '0 , 32 38 39 , 0 2 0 , 2', '0 , 32 38 39 , 0 2 1 , 2', '0 , 32 38 39 , 0 2 2 , 4', '0 , 32 38 39 , 0 2 3 , 8', '0 , 32 38 39 , 0 3 0 , 4', '0 , 32 38 39 , 0 3 1 , 4', '0 , 32 38 39 , 0 3 2 , 8', '0 , 32 38 39 , 0 3 3 , 16']
+        workpackage = "2405,8 6 4,3"
+        workpackage += ";" + "2405,8 6 4,1"
+        workpackage += ";" + "2405,8 6 4,2"
+        workpackage += ";" + "2405,8 6 5,3"
+        workpackage += ";" + "2405,8 6 3,3"
+        workpackage += ";" + "2405,8 6 2,3"
 
-        run_jobs(moldb, tordb, workpackage)
+        workpackage = "2405,8 6 4,2"
+
+        workpackage = "0,39 40,0;0,39 40,1;0,39 40,2"
+
+        run_jobs(moldb, tordb, workpackage, dump_sdf="test.sdf", debug=True)
 
         quit()
-
 
     return
 
